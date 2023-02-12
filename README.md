@@ -1,4 +1,4 @@
-# AIYA
+# `
 
 A Discord bot interface for Stable Diffusion
 
