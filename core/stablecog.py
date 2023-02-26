@@ -2,6 +2,7 @@ import base64
 import contextlib
 import discord
 import io
+import math
 import random
 import requests
 import time
@@ -149,9 +150,9 @@ class StableCog(commands.Cog, name='Stable Diffusion', description='Create image
         required=False,
     )
     @option(
-        'count',
-        int,
-        description='The number of images to generate. This is "Batch count", not "Batch size".',
+        'batch',
+        str,
+        description='The number of images to generate. Batch format: count,size',
         required=False,
     )
     async def dream_handler(self, ctx: discord.ApplicationContext, *,
@@ -171,7 +172,7 @@ class StableCog(commands.Cog, name='Stable Diffusion', description='Create image
                             strength: Optional[str] = None,
                             init_image: Optional[discord.Attachment] = None,
                             init_url: Optional[str],
-                            count: Optional[int] = None):
+                            batch: Optional[str] = None):
 
         # update defaults with any new defaults from settingscog
         channel = '% s' % ctx.channel.id
@@ -202,8 +203,8 @@ class StableCog(commands.Cog, name='Stable Diffusion', description='Create image
             lora = settings.read(channel)['lora']
         if strength is None:
             strength = settings.read(channel)['strength']
-        if count is None:
-            count = settings.read(channel)['count']
+        if batch is None:
+            batch = settings.read(channel)['batch']
 
         # if a model is not selected, do nothing
         model_name = 'Default'
@@ -221,12 +222,19 @@ class StableCog(commands.Cog, name='Stable Diffusion', description='Create image
                     prompt = model[1][3] + " " + prompt
                 break
 
-        # if using a banned word in prompt, do not generate
-        for x in settings.global_var.prompt_ban_list:
-            x = str(x.lower())
-            if x in simple_prompt.lower():
-                await ctx.respond(f"I'm not allowed to draw the word {x}!", ephemeral=True)
+        # run through mod function if any moderation values are set in config
+        clean_negative = negative_prompt
+        if settings.global_var.prompt_ban_list or settings.global_var.prompt_ignore_list or settings.global_var.negative_prompt_prefix:
+            mod_results = settings.prompt_mod(simple_prompt, negative_prompt)
+            if mod_results[0] == "Stop":
+                await ctx.respond(f"I'm not allowed to draw the word {mod_results[1]}!", ephemeral=True)
                 return
+            if mod_results[0] == "Mod":
+                if settings.global_var.display_ignored_words == "False":
+                    simple_prompt = mod_results[1]
+                prompt = mod_results[1]
+                negative_prompt = mod_results[2]
+                clean_negative = mod_results[3]
 
         # if a hypernet or lora is used, append it to the prompt
         if hypernet != 'None':
@@ -249,72 +257,115 @@ class StableCog(commands.Cog, name='Stable Diffusion', description='Create image
             except(Exception,):
                 await ctx.send_response('URL image not found!\nI will do my best without it!')
 
-        # formatting aiya initial reply
+        # verify values and format aiya initial reply
         reply_adds = ''
+        if (width != 512) or (height != 512):
+            reply_adds += f' - Size: ``{width}``x``{height}``'
+        reply_adds += f' - Seed: ``{seed}``'
+
         # lower step value to the highest setting if user goes over max steps
         if steps > settings.read(channel)['max_steps']:
             steps = settings.read(channel)['max_steps']
             reply_adds += f'\nExceeded maximum of ``{steps}`` steps! This is the best I can do...'
         if model_name != 'Default':
             reply_adds += f'\nModel: ``{model_name}``'
-        if negative_prompt != '':
-            reply_adds += f'\nNegative Prompt: ``{negative_prompt}``'
-        if (width != 512) or (height != 512):
-            reply_adds += f'\nSize: ``{width}``x``{height}``'
-        if guidance_scale != '7.0':
+        if clean_negative != settings.read(channel)['negative_prompt']:
+            reply_adds += f'\nNegative Prompt: ``{clean_negative}``'
+        if guidance_scale != settings.read(channel)['guidance_scale']:
+            # try to convert string to Web UI-friendly float
             try:
+                guidance_scale = guidance_scale.replace(",", ".")
                 float(guidance_scale)
                 reply_adds += f'\nGuidance Scale: ``{guidance_scale}``'
             except(Exception,):
                 reply_adds += f"\nGuidance Scale can't be ``{guidance_scale}``! Setting to default of `7.0`."
                 guidance_scale = 7.0
-        if sampler != 'Euler a':
+        if sampler != settings.read(channel)['sampler']:
             reply_adds += f'\nSampler: ``{sampler}``'
         if init_image:
-            reply_adds += f'\nStrength: ``{strength}``'
+            # try to convert string to Web UI-friendly float
+            try:
+                strength = strength.replace(",", ".")
+                float(strength)
+                reply_adds += f'\nStrength: ``{strength}``'
+            except(Exception,):
+                reply_adds += f"\nStrength can't be ``{strength}``! Setting to default of `0.75`."
+                strength = 0.75
             reply_adds += f'\nURL Init Image: ``{init_image.url}``'
-        if count != 1:
-            max_count = settings.read(channel)['max_count']
-            if count > max_count:
-                count = max_count
-                reply_adds += f'\nExceeded maximum of ``{count}`` images! This is the best I can do...'
-            reply_adds += f'\nCount: ``{count}``'
-        if style != 'None':
+        # try to convert batch to usable format
+        batch_check = settings.batch_format(batch)
+        batch = list(batch_check)
+        if batch[0] != 1 or batch[1] != 1:
+            max_batch = settings.batch_format(settings.read(channel)['max_batch'])
+            # if only one number is provided, try to generate the requested amount, prioritizing batch size
+            if batch[2] == 1:
+                # if over the limits, cut the number in half and let AIYA scale down
+                total = max_batch[0] * max_batch[1]
+
+                # add hard limit of 10 images until I can figure how to bypass this discord limit - single value edition
+                if batch[0] > 10:
+                    batch[0] = 10
+                    if total > 10:
+                        total = 10
+                    reply_adds += f"\nI'm currently limited to a max of 10 drawings per post..."
+
+                if batch[0] > total:
+                    batch[0] = math.ceil(batch[0] / 2)
+                    batch[1] = math.ceil(batch[0] / 2)
+                else:
+                    # do... math
+                    difference = math.ceil(batch[0] / max_batch[1])
+                    multiple = int(batch[0] / difference)
+                    new_total = difference * multiple
+                    requested = batch[0]
+                    batch[0], batch[1] = difference, multiple
+                    if requested % difference != 0:
+                        reply_adds += f"\nI can't draw exactly ``{requested}`` pictures! Settling for ``{new_total}``."
+            # check batch values against the maximum limits
+            if batch[0] > max_batch[0]:
+                reply_adds += f"\nThe max batch count I'm allowed here is ``{max_batch[0]}``!"
+                batch[0] = max_batch[0]
+            if batch[1] > max_batch[1]:
+                reply_adds += f"\nThe max batch size I'm allowed here is ``{max_batch[1]}``!"
+                batch[1] = max_batch[1]
+
+            # add hard limit of 10 images until I can figure how to bypass this discord limit - multi value edition
+            if batch[0] * batch[1] > 10:
+                while batch[0] * batch[1] > 10:
+                    if batch[0] != 1:
+                        batch[0] -= 1
+                    if batch[1] != 1:
+                        batch[1] -= 1
+                reply_adds += f"\nI'm currently limited to a max of 10 drawings per post..."
+
+            reply_adds += f'\nBatch count: ``{batch[0]}`` - Batch size: ``{batch[1]}``'
+        if style != settings.read(channel)['style']:
             reply_adds += f'\nStyle: ``{style}``'
-        if hypernet != 'None':
+        if hypernet != settings.read(channel)['hypernet']:
             reply_adds += f'\nHypernet: ``{hypernet}``'
-        if lora != 'None':
+        if lora != settings.read(channel)['lora']:
             reply_adds += f'\nLoRA: ``{lora}``'
-        if facefix != 'None':
+        if facefix != settings.read(channel)['facefix']:
             reply_adds += f'\nFace restoration: ``{facefix}``'
-        if clip_skip != 1:
+        if clip_skip != settings.read(channel)['clip_skip']:
             reply_adds += f'\nCLIP skip: ``{clip_skip}``'
 
         # set up tuple of parameters to pass into the Discord view
         input_tuple = (
             ctx, simple_prompt, prompt, negative_prompt, data_model, steps, width, height, guidance_scale, sampler, seed, strength,
-            init_image, count, style, facefix, highres_fix, clip_skip, hypernet, lora)
+            init_image, batch, style, facefix, highres_fix, clip_skip, hypernet, lora)
         view = viewhandler.DrawView(input_tuple)
         # setup the queue
-        user_queue = 0
-        user_queue_limit = False
-        for queue_object in queuehandler.GlobalQueue.queue:
-            if queue_object.ctx.author.id == ctx.author.id:
-                user_queue += 1
-                if user_queue >= settings.global_var.queue_limit:
-                    user_queue_limit = True
-                    break
+        user_queue_limit = settings.queue_check(ctx.author)
         if queuehandler.GlobalQueue.dream_thread.is_alive():
-            if user_queue_limit:
+            if user_queue_limit == "Stop":
                 await ctx.send_response(content=f"Please wait! You're past your queue limit of {settings.global_var.queue_limit}.", ephemeral=True)
             else:
                 queuehandler.GlobalQueue.queue.append(queuehandler.DrawObject(self, *input_tuple, view))
-                await ctx.send_response(
-                    f'<@{ctx.author.id}>, {settings.messages()}\nQueue: ``{len(queuehandler.GlobalQueue.queue)}`` - ``{simple_prompt}``\nSteps: ``{steps}`` - Seed: ``{seed}``{reply_adds}')
         else:
             await queuehandler.process_dream(self, queuehandler.DrawObject(self, *input_tuple, view))
-            await ctx.send_response(
-                f'<@{ctx.author.id}>, {settings.messages()}\nQueue: ``{len(queuehandler.GlobalQueue.queue)}`` - ``{simple_prompt}``\nSteps: ``{steps}`` - Seed: ``{seed}``{reply_adds}')
+        if user_queue_limit != "Stop":
+            await ctx.send_response(f'<@{ctx.author.id}>, {settings.messages()}\nQueue: ``{len(queuehandler.GlobalQueue.queue)}`` - ``{simple_prompt}``\nSteps: ``{steps}``{reply_adds}')
 
     # the function to queue Discord posts
     def post(self, event_loop: AbstractEventLoop, post_queue_object: queuehandler.PostObject):
@@ -354,7 +405,8 @@ class StableCog(commands.Cog, name='Stable Diffusion', description='Create image
                 "seed_resize_from_h": 0,
                 "seed_resize_from_w": 0,
                 "denoising_strength": None,
-                "n_iter": queue_object.batch_count,
+                "n_iter": queue_object.batch[0],
+                "batch_size": queue_object.batch[1],
                 "styles": [
                     queue_object.style
                 ]
@@ -428,22 +480,26 @@ class StableCog(commands.Cog, name='Stable Diffusion', description='Create image
                 image = Image.open(io.BytesIO(base64.b64decode(image_base64.split(",", 1)[0])))
                 pil_images.append(image)
 
-                # grab png info
-                png_payload = {
-                    "image": "data:image/png;base64," + image_base64
-                }
-                png_response = s.post(url=f'{settings.global_var.url}/sdapi/v1/png-info', json=png_payload)
+                if settings.global_var.save_metadata == 'True':
+                    # grab png info
+                    png_payload = {
+                        "image": "data:image/png;base64," + image_base64
+                    }
+                    png_response = s.post(url=f'{settings.global_var.url}/sdapi/v1/png-info', json=png_payload)
 
-                metadata = PngImagePlugin.PngInfo()
-                epoch_time = int(time.time())
-                metadata.add_text("parameters", png_response.json().get("info"))
+                    metadata = PngImagePlugin.PngInfo()
+                    metadata.add_text("parameters", png_response.json().get("info"))
+                else:
+                    metadata = ''
+
                 if settings.global_var.save_outputs == 'True':
+                    epoch_time = int(time.time())
                     file_path = f'{settings.global_var.dir}/{epoch_time}-{queue_object.seed}-{file_name[0:120]}-{i}.png'
                     image.save(file_path, pnginfo=metadata)
                     print(f'Saved image: {file_path}')
 
             # increment number of images generated
-            settings.stats_count(queue_object.batch_count)
+            settings.stats_count(queue_object.batch[0]*queue_object.batch[1])
 
             # post to discord
             def post_dream():
@@ -457,8 +513,7 @@ class StableCog(commands.Cog, name='Stable Diffusion', description='Create image
                         pil_image.save(buffer, 'PNG', pnginfo=metadata)
                         buffer.seek(0)
                     draw_time = '{0:.3f}'.format(end_time - start_time)
-                    message = f'my {noun_descriptor} of ``{queue_object.simple_prompt}`` took me ``{draw_time}`` ' \
-                              f'seconds!\n> *{queue_object.ctx.author.name}#{queue_object.ctx.author.discriminator}*'
+                    message = f'my {noun_descriptor} of ``{queue_object.simple_prompt}`` took me ``{draw_time}`` seconds!'
                     files = [discord.File(fp=buffer, filename=f'{queue_object.seed}-{i}.png') for (i, buffer) in
                              enumerate(buffer_handles)]
 

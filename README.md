@@ -49,7 +49,7 @@ To generate an image from text, use the /draw command and include your prompt as
 ## Setup requirements
 
 - Set up [AUTOMATIC1111's Stable Diffusion AI Web UI](https://github.com/AUTOMATIC1111/stable-diffusion-webui).
-  - AIYA is currently tested on commit `ea9bd9fc7409109adcd61b897abc2c8881161256` of the Web UI.
+  - AIYA is currently tested on commit `65995a2ea38a1a0afd06cb508a4f65fd0d3a1743` of the Web UI.
 - Run the Web UI as local host with API (`COMMANDLINE_ARGS= --api`).
 - Clone this repo.
 - Create a file in your cloned repo called ".env", formatted like so:
@@ -58,6 +58,34 @@ To generate an image from text, use the /draw command and include your prompt as
 TOKEN = put your bot token here
 ```
 - Run AIYA by running launch.bat (or launch.sh for Linux)
+
+## Deploy with Docker
+
+AIYA can be deployed using Docker.
+
+The docker image supports additional configuration by adding environment variables or config file updates detailed in the [wiki](https://github.com/Kilvoctu/aiyabot/wiki/Configuration).
+
+### Docker run
+
+```bash
+docker run --name aiyabot --network=host --restart=always -e TOKEN=your_token_here -e TZ=America/New_York -v ./aiyabot/outputs:/app/outputs -v ./aiyabot/resources:/app/resources -d ghcr.io/kilvoctu/aiyabot:latest
+```
+
+Note the following environment variables work with the docker image:
+
+- `TOKEN` - **[Required]** Discord bot token.
+- `URL` - URL of the Web UI API. Defaults to `http://localhost:7860`.
+- `TZ` - Timezone for the container in the format `America/New_York`. Defaults to `America/New_York`
+- `APIUSER` - API username if required for your Web UI instance.
+- `APIPASS` - API password if required for your Web UI instance.
+- `USER` - Username if required for your Web UI instance.
+- `PASS` - Password if required for your Web UI instance.
+
+### Docker compose
+
+- Clone the repo and refer to the `docker-compose.yml` file in the `deploy` directory.
+- Rename the `/deploy/.env.example` file to `.env` and update the `TOKEN` variable with your bot token (and any other configuration as desired).
+- Run `docker-compose up -d` to start the bot.
 
 ## Notes
 

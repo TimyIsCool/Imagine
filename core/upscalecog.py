@@ -25,6 +25,10 @@ class UpscaleCog(commands.Cog):
         self.bot = bot
         self.file_name = ''
 
+    @commands.Cog.listener()
+    async def on_ready(self):
+        self.bot.add_view(viewhandler.DeleteView(self))
+
     @commands.slash_command(name='upscale', description='Upscale an image', guild_only=True)
     @option(
         'init_image',
@@ -135,28 +139,19 @@ class UpscaleCog(commands.Cog):
 
         # set up tuple of parameters
         input_tuple = (ctx, resize, init_image, upscaler_1, upscaler_2, upscaler_2_strength, gfpgan, codeformer, upscale_first)
-        view = viewhandler.DeleteView(ctx.author.id)
+        view = viewhandler.DeleteView(input_tuple)
         # set up the queue if an image was found
-        user_queue = 0
-        user_queue_limit = False
-        for queue_object in queuehandler.GlobalQueue.queue:
-            if queue_object.ctx.author.id == ctx.author.id:
-                user_queue += 1
-                if user_queue >= settings.global_var.queue_limit:
-                    user_queue_limit = True
-                    break
+        user_queue_limit = settings.queue_check(ctx.author)
         if has_image:
             if queuehandler.GlobalQueue.dream_thread.is_alive():
-                if user_queue_limit:
+                if user_queue_limit == "Stop":
                     await ctx.send_response(content=f"Please wait! You're past your queue limit of {settings.global_var.queue_limit}.", ephemeral=True)
                 else:
                     queuehandler.GlobalQueue.queue.append(queuehandler.UpscaleObject(self, *input_tuple, view))
-                    await ctx.send_response(
-                        f'<@{ctx.author.id}>, {settings.messages()}\nQueue: ``{len(queuehandler.GlobalQueue.queue)}`` - Scale: ``{resize}``x - Upscaler: ``{upscaler_1}``{reply_adds}')
             else:
                 await queuehandler.process_dream(self, queuehandler.UpscaleObject(self, *input_tuple, view))
-                await ctx.send_response(
-                    f'<@{ctx.author.id}>, {settings.messages()}\nQueue: ``{len(queuehandler.GlobalQueue.queue)}`` - Scale: ``{resize}``x - Upscaler: ``{upscaler_1}``{reply_adds}')
+            if user_queue_limit != "Stop":
+                await ctx.send_response(f'<@{ctx.author.id}>, {settings.messages()}\nQueue: ``{len(queuehandler.GlobalQueue.queue)}`` - Scale: ``{resize}``x - Upscaler: ``{upscaler_1}``{reply_adds}')
 
     # the function to queue Discord posts
     def post(self, event_loop: AbstractEventLoop, post_queue_object: queuehandler.PostObject):
@@ -215,8 +210,8 @@ class UpscaleCog(commands.Cog):
             file_path = f'{settings.global_var.dir}/{epoch_time}-x{queue_object.resize}-{self.file_name[0:120]}.png'
 
             # save local copy of image
+            image_data = response_data['image']
             if settings.global_var.save_outputs == 'True':
-                image_data = response_data['image']
                 with open(file_path, "wb") as fh:
                     fh.write(base64.b64decode(image_data))
                 print(f'Saved image: {file_path}')
@@ -229,8 +224,7 @@ class UpscaleCog(commands.Cog):
                     buffer.seek(0)
 
                     draw_time = '{0:.3f}'.format(end_time - start_time)
-                    message = f'my upscale of ``{queue_object.resize}``x took me ``{draw_time}`` ' \
-                              f'seconds!\n> *{queue_object.ctx.author.name}#{queue_object.ctx.author.discriminator}*'
+                    message = f'my upscale of ``{queue_object.resize}``x took me ``{draw_time}`` seconds!'
                     file = discord.File(fp=buffer, filename=file_path)
 
                     queuehandler.process_post(

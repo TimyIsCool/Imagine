@@ -8,10 +8,11 @@ import time
 import tomlkit
 from typing import Optional
 
+from core import queuehandler
+
 self = discord.Bot()
 dir_path = os.path.dirname(os.path.realpath(__file__))
 path = 'resources/'.format(dir_path)
-
 
 # the fallback defaults for AIYA if bot host doesn't set anything
 template = {
@@ -30,8 +31,8 @@ template = {
     "hypernet": "None",
     "lora": "None",
     "strength": "0.75",
-    "count": 1,
-    "max_count": 1,
+    "batch": "1,1",
+    "max_batch": "1,1",
     "upscaler_1": "ESRGAN_4x"
 }
 
@@ -51,6 +52,8 @@ apipass = ""
 
 # Whether or not to save outputs to disk ("True"/"False")
 save_outputs = "True"
+# Whether or not to include parameter info into images ("True"/"False")
+save_metadata = "True"
 
 # The directory to save outputs (default = "outputs")
 dir = "outputs"
@@ -64,6 +67,12 @@ max_size = 1024
 # AIYA won't generate if prompt has any words in the ban list.
 # Separate with commas; example, ["a", "b", "c"]
 prompt_ban_list = []
+# These words will be automatically removed from the prompt.
+prompt_ignore_list = []
+# Choose whether or not ignored words are displayed to user.
+display_ignored_words = "False"
+# These words will be added to the beginning of the negative prompt.
+negative_prompt_prefix = []
 """
 
 
@@ -92,19 +101,80 @@ class GlobalVar:
     upscaler_names = []
     hires_upscaler_names = []
     save_outputs = "True"
+    save_metadata = "True"
     queue_limit = 1
     prompt_ban_list = []
+    prompt_ignore_list = []
+    display_ignored_words = "False"
+    negative_prompt_prefix = []
 
 
 global_var = GlobalVar()
 
 
+def batch_format(batch_string):
+    format_batch_string = batch_string.replace(".", ",").split(",")
+    values_given = len(format_batch_string)
+    if values_given < 2:
+        format_batch_string.append('1')
+    # try to ensure each value is an integer of at least 1
+    try:
+        count = int(format_batch_string[0])
+        if count < 1:
+            count = 1
+    except(Exception,):
+        count = 1
+    try:
+        size = int(format_batch_string[1])
+        if size < 1:
+            size = 1
+    except(Exception,):
+        size = 1
+    return count, size, values_given
+
+
+def prompt_mod(prompt, negative_prompt):
+    clean_negative_prompt = negative_prompt
+    # if any banned words are in prompt, return immediately
+    if global_var.prompt_ban_list:
+        for x in global_var.prompt_ban_list:
+            x = str(x.lower())
+            if x in prompt.lower():
+                return "Stop", x
+    # otherwise mod the prompt/negative prompt
+    if global_var.prompt_ignore_list or global_var.negative_prompt_prefix:
+        for y in global_var.prompt_ignore_list:
+            y = str(y.lower())
+            if y in prompt.lower():
+                prompt = prompt.replace(y, "")
+        prompt = ' '.join(prompt.split())
+        if prompt == '':
+            prompt = ' '
+        for z in global_var.negative_prompt_prefix:
+            z = str(z.lower())
+            if z in negative_prompt.lower():
+                clean_negative_prompt = clean_negative_prompt.replace(z, "")
+            else:
+                negative_prompt = f"{z} {negative_prompt}"
+        return "Mod", prompt, negative_prompt.strip(), clean_negative_prompt.strip()
+    return "None"
+
+
+def queue_check(author_compare):
+    user_queue = 0
+    for queue_object in queuehandler.GlobalQueue.queue:
+        if queue_object.ctx.author.id == author_compare.id:
+            user_queue += 1
+            if user_queue >= global_var.queue_limit:
+                return "Stop"
+
+
 def stats_count(number):
     with open(f'{path}stats.txt', 'r') as f:
-        data = list(map(int, f.readlines()))
+        data = list(map(float, f.readlines()))
     data[0] += number
     with open(f'{path}stats.txt', 'w') as f:
-        f.write('\n'.join(str(x) for x in data))
+        f.write('\n'.join(str(int(x)) for x in data))
 
 
 def messages():
@@ -137,6 +207,17 @@ def read(channel_id):
     with open(path + channel_id + '.json', 'r') as configfile:
         settings = dict(template)
         settings.update(json.load(configfile))
+
+        # update deprecated 'count' to 'batch'
+        if 'count' in settings or 'max_count' in settings:
+            try:
+                settings['batch'] = str(settings.pop('count'))
+                settings['max_batch'] = str(settings.pop('max_count'))
+            except(Exception,):
+                pass
+            with open(path + channel_id + '.json', 'w') as configfile2:
+                json.dump(settings, configfile2, indent=1)
+
     return settings
 
 
@@ -169,7 +250,7 @@ def startup_check():
 
     # update the config if any new keys were added
     if not tomlkit.loads(default_config).keys() == config.keys():
-        print('Configuration file is missing keys! Updating the file.')
+        print('Configuration file keys mismatch! Updating the file.')
         temp_config = {}
         for k, v in config.items():
             temp_config[k] = v
@@ -234,7 +315,7 @@ def startup_check():
 
 def files_check():
     # load random messages for aiya to say
-    with open(f'{path}messages.csv') as csv_file:
+    with open(f'{path}messages.csv', encoding='UTF-8') as csv_file:
         message_data = list(csv.reader(csv_file, delimiter='|'))
         for row in message_data:
             global_var.wait_message.append(row[0])
@@ -306,12 +387,15 @@ def populate_global_vars():
     global_var.api_pass = config['apipass']
 
     global_var.save_outputs = config['save_outputs']
+    global_var.save_metadata = config['save_metadata']
     global_var.queue_limit = config['queue_limit']
     global_var.prompt_ban_list = [x for x in config['prompt_ban_list']]
+    global_var.prompt_ignore_list = [x for x in config['prompt_ignore_list']]
+    global_var.display_ignored_words = config['display_ignored_words']
+    global_var.negative_prompt_prefix = [x for x in config['negative_prompt_prefix']]
     # slash command doesn't update this dynamically. Changes to size need a restart.
-    global_var.size_range = range(192, config['max_size']+64, 64)
+    global_var.size_range = range(192, config['max_size'] + 64, 64)
 
-    # pull list of samplers, styles and face restorers from api
     # create persistent session since we'll need to do a few API calls
     s = requests.Session()
     if global_var.api_auth:
@@ -348,11 +432,7 @@ def populate_global_vars():
             print("Can't connect to API for some reason!"
                   "Please check your .env URL or credentials.")
             os.system("pause")
-
-    # add default "None" options
     global_var.style_names['None'] = ''
-    global_var.hyper_names.append('None')
-    # populate remaining options
     for s2 in r2.json():
         global_var.style_names[s2['name']] = s2['prompt'], s2['negative_prompt']
     for s3 in r3.json():
@@ -384,8 +464,10 @@ def populate_global_vars():
         model_data = list(csv.reader(csv_file, delimiter='|'))
         for row in model_data[1:]:
             for model in r.json():
-                if row[1].split(os.sep)[-1] == model['filename'].split(os.sep)[-1] \
-                        or row[1].replace(os.sep, '_') == model['model_name']:
+                norm_csv_path = os.path.normpath(row[1])
+                norm_api_path = os.path.normpath(model['filename'])
+                if norm_csv_path.split(os.sep)[-1] == norm_api_path.split(os.sep)[-1] \
+                        or norm_csv_path.replace(os.sep, '_') == model['model_name']:
                     global_var.model_info[row[0]] = model['title'], model['model_name'], model['hash'], row[2]
                     break
     # add "Default" if models.csv is on default, or if no model matches are found
@@ -407,6 +489,11 @@ def populate_global_vars():
                 pass
     except(Exception,):
         print("Trouble accessing Web UI config! I can't pull the LoRAs or High-res upscaler lists!")
+    # format some global lists, ensure default "None" options exist
+    if 'None' not in global_var.facefix_models:
+        global_var.facefix_models.insert(0, 'None')
+    if 'None' not in global_var.hyper_names:
+        global_var.hyper_names.insert(0, 'None')
     global_var.lora_names.remove('')
     global_var.lora_names.insert(0, 'None')
     global_var.hires_upscaler_names.insert(0, 'Disabled')
